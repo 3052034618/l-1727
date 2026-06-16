@@ -2,7 +2,7 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as path from 'path';
 
-const PROTO_PATH = path.join(__dirname, '..', 'proto', 'user.proto');
+const PROTO_PATH = path.join(__dirname, '..', '..', 'proto', 'user.proto');
 
 const MOCK_USERS: Record<string, { id: string; name: string; email: string }> = {
   '1': { id: '1', name: 'Alice Johnson', email: 'alice@example.com' },

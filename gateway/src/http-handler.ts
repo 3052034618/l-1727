@@ -5,7 +5,7 @@ import { UnifiedRouter } from './router';
 import { ProtocolConverter } from './converter';
 import { GrpcClientPool } from './grpc-client-pool';
 import { ConnectionManager } from './connection-manager';
-import { RouteRegistry } from './route-registry';
+import { RouteRegistry, DEFAULT_TARGET_NAME } from './route-registry';
 
 interface StreamState {
   connId: string | null;
@@ -14,6 +14,11 @@ interface StreamState {
   streamRef: any;
   reqRef: IncomingMessage;
   resRef: ServerResponse;
+  startTime: number;
+  targetName: string;
+  recorded: boolean;
+  hasError: boolean;
+  errorMessage?: string;
 }
 
 export class HttpHandler {
@@ -37,6 +42,7 @@ export class HttpHandler {
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const startTime = Date.now();
     let ruleId: string | undefined;
+    let targetName: string = DEFAULT_TARGET_NAME;
     let isError = false;
     let errorMsg: string | undefined;
 
@@ -64,6 +70,7 @@ export class HttpHandler {
       }
 
       ruleId = route.ruleId;
+      targetName = ctx.grayTargetName || DEFAULT_TARGET_NAME;
       ctx.matchedRuleId = ruleId;
 
       const safeHeader = (v: string) => /[^\x20-\x7E]/.test(v) ? encodeURIComponent(v) : v;
@@ -71,18 +78,23 @@ export class HttpHandler {
       res.setHeader('X-Gateway-Rule-Name', safeHeader(route.ruleName));
       res.setHeader('X-Gateway-Route', safeHeader(`${route.serviceName}/${route.methodName}`));
       res.setHeader('X-Gateway-Conversion', `${route.sourceProtocol}->${route.targetProtocol}`);
+      res.setHeader('X-Gateway-Target', targetName);
 
       if (route.targetProtocol === Protocol.GRPC) {
-        await this.handleHttpToGrpc(req, res, ctx, route);
+        await this.handleHttpToGrpc(req, res, ctx, route, targetName, startTime);
       } else if (route.targetProtocol === Protocol.HTTP) {
+        isError = true;
+        errorMsg = 'HTTP-to-HTTP proxying not yet implemented';
         this.sendError(res, 501, {
           code: 'NOT_IMPLEMENTED',
-          message: 'HTTP-to-HTTP proxying not yet implemented',
+          message: errorMsg,
         });
       } else {
+        isError = true;
+        errorMsg = `Unsupported target protocol: ${route.targetProtocol}`;
         this.sendError(res, 502, {
           code: 'UNSUPPORTED_TARGET_PROTOCOL',
-          message: `Unsupported target protocol: ${route.targetProtocol}`,
+          message: errorMsg,
           protocol: route.targetProtocol,
         });
       }
@@ -97,11 +109,16 @@ export class HttpHandler {
     } finally {
       if (ruleId) {
         const duration = Date.now() - startTime;
-        this.registry.recordRequest(ruleId, Protocol.HTTP, duration, isError, errorMsg);
-        if (!isError) {
+        this.registry.recordRequest(ruleId, Protocol.HTTP, duration, isError, errorMsg, targetName);
+        if (isError) {
+          console.error(
+            `[HTTP] ${(req.method || '').padEnd(4)} ${req.url} -> ` +
+            `${ruleId}[${targetName}] ERROR ${errorMsg} ${duration}ms`
+          );
+        } else {
           console.log(
             `[HTTP] ${(req.method || '').padEnd(4)} ${req.url} -> ` +
-            `${ruleId} ${duration}ms`
+            `${ruleId}[${targetName}] ${duration}ms`
           );
         }
       }
@@ -112,21 +129,32 @@ export class HttpHandler {
     req: IncomingMessage,
     res: ServerResponse,
     ctx: RequestContext,
-    route: Route
+    route: Route,
+    targetName: string,
+    startTime: number
   ): Promise<void> {
-    const payload = ProtocolConverter.buildGrpcPayload(route, ctx);
+    const target = this.registry.getTargetForRoute(route, targetName);
+    const effectiveRoute: Route = {
+      ...route,
+      backendAddress: target.backendAddress,
+      serviceName: target.serviceName,
+      methodName: target.methodName,
+    };
+    const payload = ProtocolConverter.buildGrpcPayload(effectiveRoute, ctx);
 
     if (route.isServerStreaming) {
-      await this.handleStreamingGrpcResponse(req, res, route, payload);
+      await this.handleStreamingGrpcResponse(req, res, effectiveRoute, payload, targetName, startTime);
     } else {
-      await this.handleUnaryGrpcResponse(res, route, payload);
+      await this.handleUnaryGrpcResponse(res, effectiveRoute, payload, targetName, startTime);
     }
   }
 
   private async handleUnaryGrpcResponse(
     res: ServerResponse,
     route: Route,
-    payload: any
+    payload: any,
+    targetName: string,
+    startTime: number
   ): Promise<void> {
     try {
       const response = await this.grpcPool.makeUnaryCall(
@@ -140,10 +168,21 @@ export class HttpHandler {
       res.writeHead(httpResponse.statusCode, {
         ...httpResponse.headers,
         'X-Gateway-Stream-Mode': 'unary',
+        'X-Gateway-Target': targetName,
       });
       res.end(JSON.stringify(httpResponse.body));
     } catch (err: any) {
       this.handleGrpcError(err, res, route);
+      const duration = Date.now() - startTime;
+      this.registry.recordRequest(
+        route.ruleId,
+        Protocol.HTTP,
+        duration,
+        true,
+        `${err.code}: ${err.message}`,
+        targetName
+      );
+      (res as any)._errorRecorded = true;
     }
   }
 
@@ -151,9 +190,51 @@ export class HttpHandler {
     req: IncomingMessage,
     res: ServerResponse,
     route: Route,
-    payload: any
+    payload: any,
+    targetName: string,
+    startTime: number
   ): Promise<void> {
     const remoteAddr = req.socket.remoteAddress || '';
+
+    const state: StreamState = {
+      connId: null,
+      cancelled: false,
+      headersSent: false,
+      streamRef: null,
+      reqRef: req,
+      resRef: res,
+      startTime,
+      targetName,
+      recorded: false,
+      hasError: false,
+    };
+
+    const finalize = (isError: boolean, errorMsg?: string) => {
+      if (state.recorded) return;
+      state.recorded = true;
+      state.hasError = isError;
+      state.errorMessage = errorMsg;
+
+      const duration = Date.now() - state.startTime;
+      this.registry.recordRequest(
+        route.ruleId,
+        Protocol.HTTP,
+        duration,
+        isError,
+        errorMsg,
+        state.targetName
+      );
+
+      if (isError) {
+        console.error(
+          `[HTTP] STREAM ${route.ruleId}[${state.targetName}] ERROR ${errorMsg} ${duration}ms`
+        );
+      } else {
+        console.log(
+          `[HTTP] STREAM ${route.ruleId}[${state.targetName}] completed ${duration}ms`
+        );
+      }
+    };
 
     const connResult = this.connectionManager.register(
       Protocol.HTTP,
@@ -173,9 +254,10 @@ export class HttpHandler {
 
     if (connResult instanceof Error) {
       const limits = this.connectionManager.getLimitsByProtocol();
+      const errMsg = connResult.message;
       this.sendError(res, 503, {
         code: 'STREAM_QUOTA_EXCEEDED',
-        message: connResult.message,
+        message: errMsg,
         details: {
           ruleId: route.ruleId,
           ruleName: route.ruleName,
@@ -184,20 +266,12 @@ export class HttpHandler {
           retryAfterSeconds: 5,
         },
       });
+      finalize(true, `STREAM_QUOTA_EXCEEDED: ${errMsg}`);
       return;
     }
 
-    const connId = connResult.id;
-    this.registry.incrementActive(route.ruleId, Protocol.HTTP);
-
-    const state: StreamState = {
-      connId,
-      cancelled: false,
-      headersSent: false,
-      streamRef: null,
-      reqRef: req,
-      resRef: res,
-    };
+    state.connId = connResult.id;
+    this.registry.incrementActive(route.ruleId, Protocol.HTTP, targetName);
 
     let stream: any;
     try {
@@ -209,9 +283,10 @@ export class HttpHandler {
       );
       state.streamRef = stream;
     } catch (grpcErr: any) {
-      this.connectionManager.unregister(connId);
-      this.registry.decrementActive(route.ruleId, Protocol.HTTP);
+      this.connectionManager.unregister(state.connId!);
+      this.registry.decrementActive(route.ruleId, Protocol.HTTP, targetName);
       this.handleGrpcError(grpcErr, res, route);
+      finalize(true, `${grpcErr.code}: ${grpcErr.message}`);
       return;
     }
 
@@ -222,14 +297,16 @@ export class HttpHandler {
         'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
         'X-Gateway-Stream': 'grpc-server-streaming-to-ndjson',
-        'X-Gateway-Stream-Id': connId,
+        'X-Gateway-Stream-Id': state.connId!,
         'X-Gateway-Rule-Id': route.ruleId,
+        'X-Gateway-Target': targetName,
       });
       state.headersSent = true;
     } catch (headerErr: any) {
       stream.cancel();
-      this.connectionManager.unregister(connId);
-      this.registry.decrementActive(route.ruleId, Protocol.HTTP);
+      this.connectionManager.unregister(state.connId!);
+      this.registry.decrementActive(route.ruleId, Protocol.HTTP, targetName);
+      finalize(true, `header_write_error: ${headerErr.message}`);
       return;
     }
 
@@ -239,7 +316,7 @@ export class HttpHandler {
       try {
         const plainData = ProtocolConverter.protobufToPlainObject(chunk);
         res.write(JSON.stringify({ type: 'data', data: plainData, timestamp: Date.now() }) + '\n');
-        this.connectionManager.updateActivity(connId);
+        this.connectionManager.updateActivity(state.connId!);
       } catch (writeErr: any) {
         console.error('[HTTP] Stream write error:', writeErr.message);
         state.cancelled = true;
@@ -257,15 +334,17 @@ export class HttpHandler {
             type: 'stream_end',
             meta: {
               ruleId: route.ruleId,
-              streamId: connId,
+              streamId: state.connId,
+              targetName: state.targetName,
               completedAt: Date.now(),
             },
           }) + '\n');
           res.end();
         }
       } finally {
-        this.connectionManager.unregister(connId);
-        this.registry.decrementActive(route.ruleId, Protocol.HTTP);
+        this.connectionManager.unregister(state.connId!);
+        this.registry.decrementActive(route.ruleId, Protocol.HTTP, state.targetName);
+        finalize(false);
       }
     });
 
@@ -295,8 +374,9 @@ export class HttpHandler {
         } catch {}
       }
 
-      this.connectionManager.unregister(connId);
-      this.registry.decrementActive(route.ruleId, Protocol.HTTP);
+      this.connectionManager.unregister(state.connId!);
+      this.registry.decrementActive(route.ruleId, Protocol.HTTP, state.targetName);
+      finalize(true, `${err.code}: ${err.message}`);
     });
 
     const handleClientClose = () => {
@@ -311,7 +391,7 @@ export class HttpHandler {
               code: 'CLIENT_CLOSED',
               message: 'Client closed connection before response completed',
               ruleId: route.ruleId,
-              streamId: connId,
+              streamId: state.connId,
             });
           } else {
             try {
@@ -319,7 +399,8 @@ export class HttpHandler {
                 type: 'stream_end',
                 meta: {
                   ruleId: route.ruleId,
-                  streamId: connId,
+                  streamId: state.connId,
+                  targetName: state.targetName,
                   completedAt: Date.now(),
                   reason: 'client_disconnected',
                 },
@@ -329,8 +410,9 @@ export class HttpHandler {
           }
         }
       } finally {
-        this.connectionManager.unregister(connId);
-        this.registry.decrementActive(route.ruleId, Protocol.HTTP);
+        this.connectionManager.unregister(state.connId!);
+        this.registry.decrementActive(route.ruleId, Protocol.HTTP, state.targetName);
+        finalize(false, 'client_disconnected');
       }
     };
 

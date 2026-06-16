@@ -9,23 +9,37 @@ import { HttpHandler } from './http-handler';
 import { WsHandler } from './ws-handler';
 import { GrpcHandler } from './grpc-handler';
 import { RouteRegistry } from './route-registry';
-import { Protocol, RuleCreateInput, RuleUpdateInput, BusinessRule } from './types';
+import { AdminAuth } from './admin-auth';
+import { Protocol, RuleCreateInput, RuleUpdateInput, BusinessRule, GrayTarget, AdminConfig } from './types';
+
+const ADMIN_TOKEN = process.env.GATEWAY_ADMIN_TOKEN || 'admin-secret-token';
+const ADMIN_AUTH_ENABLED = process.env.GATEWAY_ADMIN_AUTH_ENABLED === 'true';
 
 async function main() {
-  const protoPath = path.join(__dirname, '..', 'proto', 'user.proto');
+  const protoPath = path.join(__dirname, '..', '..', 'proto', 'user.proto');
   const config: GatewayConfig = createDefaultConfig(protoPath);
 
+  const adminConfig: AdminConfig = {
+    enabled: ADMIN_AUTH_ENABLED,
+    tokens: [ADMIN_TOKEN],
+    tokenHeader: 'x-admin-token',
+    auditLogMaxEntries: 1000,
+  };
+  const adminAuth = new AdminAuth(adminConfig);
+
   console.log('========================================');
-  console.log('  Multi-Protocol Unified Gateway (v2)  ');
+  console.log('  Multi-Protocol Unified Gateway (v3)  ');
   console.log('========================================');
   console.log(`  HTTP/WS Port : ${config.httpPort}`);
   console.log(`  gRPC Port    : ${config.grpcPort}`);
   console.log(`  Backend      : ${config.grpcBackendAddress}`);
   console.log(`  WS Max Conn  : ${config.wsMaxConnections}`);
   console.log(`  HTTP Streams : ${config.httpMaxConcurrentStreams}`);
+  console.log(`  Admin Auth   : ${adminAuth.isEnabled() ? 'ON (token required)' : 'OFF (open access)'}`);
   console.log('========================================\n');
 
   const registry = new RouteRegistry();
+  registry.setAuditLogMaxEntries(adminAuth.getAuditLogMaxEntries());
   registry.loadRules(createDefaultBusinessRules());
 
   const router = new UnifiedRouter(registry);
@@ -55,17 +69,28 @@ async function main() {
     const url = req.url || '/';
 
     if (url.startsWith('/admin/rules')) {
-      await handleAdminRules(req, res, registry);
+      await handleAdminRules(req, res, registry, adminAuth);
       return;
     }
 
     if (url.startsWith('/admin/metrics')) {
-      handleAdminMetrics(req, res, registry, connectionManager, wsHandler);
+      adminAuth.middleware(req, res, () => {
+        handleAdminMetrics(req, res, registry, connectionManager, wsHandler);
+      });
       return;
     }
 
     if (url.startsWith('/admin/connections')) {
-      handleAdminConnections(req, res, connectionManager, wsHandler, registry);
+      adminAuth.middleware(req, res, () => {
+        handleAdminConnections(req, res, connectionManager, wsHandler, registry);
+      });
+      return;
+    }
+
+    if (url.startsWith('/admin/audit-logs')) {
+      adminAuth.middleware(req, res, () => {
+        handleAdminAuditLogs(req, res, registry);
+      });
       return;
     }
 
@@ -80,6 +105,7 @@ async function main() {
           total: registry.listRules().length,
           enabled: registry.listRules().filter(r => r.enabled).length,
         },
+        adminAuth: adminAuth.isEnabled(),
       });
       return;
     }
@@ -117,17 +143,30 @@ async function main() {
 
   console.log('========================================');
   console.log('  Admin API (port 8080):');
-  console.log('    GET    /admin/rules              List rules');
-  console.log('    GET    /admin/rules/:id          Get rule');
-  console.log('    POST   /admin/rules              Create rule');
-  console.log('    PUT    /admin/rules/:id          Update rule');
-  console.log('    DELETE /admin/rules/:id          Delete rule');
-  console.log('    PATCH  /admin/rules/:id/enable   Enable rule');
-  console.log('    PATCH  /admin/rules/:id/disable  Disable rule');
-  console.log('    GET    /admin/metrics            Full metrics');
-  console.log('    GET    /admin/connections        All connections');
-  console.log('    GET    /stats                    Aggregated view');
-  console.log('    GET    /health                   Health check');
+  console.log('    Rules:');
+  console.log('      GET    /admin/rules');
+  console.log('      GET    /admin/rules/:id');
+  console.log('      POST   /admin/rules');
+  console.log('      PUT    /admin/rules/:id');
+  console.log('      DELETE /admin/rules/:id');
+  console.log('      PATCH  /admin/rules/:id/enable');
+  console.log('      PATCH  /admin/rules/:id/disable');
+  console.log('    Versions:');
+  console.log('      GET    /admin/rules/:id/versions');
+  console.log('      POST   /admin/rules/:id/versions');
+  console.log('      POST   /admin/rules/:id/rollback/:versionId');
+  console.log('    Gray release:');
+  console.log('      GET    /admin/rules/:id/gray-targets');
+  console.log('      PUT    /admin/rules/:id/gray-targets');
+  console.log('    Metrics & Stats:');
+  console.log('      GET    /admin/metrics');
+  console.log('      GET    /admin/connections');
+  console.log('      GET    /admin/audit-logs');
+  console.log('      GET    /stats');
+  console.log('      GET    /health');
+  if (adminAuth.isEnabled()) {
+    console.log(`  * Admin auth enabled, use header: ${adminAuth.getTokenHeader()}`);
+  }
   console.log('========================================');
   console.log('\n[Gateway] All protocols active. Press Ctrl+C to shut down.\n');
 
@@ -181,16 +220,26 @@ function printEndpoints(registry: RouteRegistry): void {
 
 function setupRegistryListeners(registry: RouteRegistry): void {
   registry.on('rule:added', (rule) => {
-    console.log(`[Registry] Rule ADDED: ${rule.id} ("${rule.name}") with ${rule.endpoints.length} endpoints`);
+    console.log(`[Registry] Rule ADDED: ${rule.id} ("${rule.name}") v${rule.version} with ${rule.endpoints.length} endpoints`);
   });
   registry.on('rule:updated', (rule, prev) => {
     const changes: string[] = [];
     if (prev.enabled !== rule.enabled) changes.push(`enabled: ${prev.enabled}->${rule.enabled}`);
     if (prev.endpoints.length !== rule.endpoints.length) changes.push(`endpoints: ${prev.endpoints.length}->${rule.endpoints.length}`);
+    if (prev.version !== rule.version) changes.push(`version: ${prev.version}->${rule.version}`);
     console.log(`[Registry] Rule UPDATED: ${rule.id} (${changes.join(', ') || 'metadata changed'})`);
   });
   registry.on('rule:deleted', (id) => {
     console.log(`[Registry] Rule DELETED: ${id}`);
+  });
+  registry.on('rule:rolled-back', (rule, version) => {
+    console.log(`[Registry] Rule ROLLED BACK: ${rule.id} to version ${version.version} (now v${rule.version})`);
+  });
+  registry.on('version:created', (version) => {
+    console.log(`[Registry] Version CREATED: ${version.ruleId}@${version.version} (${version.id})`);
+  });
+  registry.on('audit:entry', (entry) => {
+    console.log(`[Audit] ${entry.action} | ${entry.actor} | ${entry.ruleId} | ${entry.timestamp}`);
   });
   registry.on('routes:changed', (rules) => {
     const totalEp = rules.reduce((s, r) => s + r.endpoints.length, 0);
@@ -244,10 +293,20 @@ function extractPath(url: string): string {
   return idx === -1 ? url : url.slice(0, idx);
 }
 
+function requireAuth(
+  req: IncomingMessage,
+  res: ServerResponse,
+  adminAuth: AdminAuth,
+  handler: (actor: string, ip: string) => void
+): void {
+  adminAuth.middleware(req, res, handler);
+}
+
 async function handleAdminRules(
   req: IncomingMessage,
   res: ServerResponse,
-  registry: RouteRegistry
+  registry: RouteRegistry,
+  adminAuth: AdminAuth
 ): Promise<void> {
   const url = req.url || '';
   const path = extractPath(url);
@@ -255,76 +314,197 @@ async function handleAdminRules(
 
   const matchId = path.match(/^\/admin\/rules\/([^\/]+)$/);
   const matchEnable = path.match(/^\/admin\/rules\/([^\/]+)\/(enable|disable)$/);
+  const matchVersions = path.match(/^\/admin\/rules\/([^\/]+)\/versions$/);
+  const matchRollback = path.match(/^\/admin\/rules\/([^\/]+)\/rollback\/([^\/]+)$/);
+  const matchGray = path.match(/^\/admin\/rules\/([^\/]+)\/gray-targets$/);
 
   if (path === '/admin/rules' && method === 'GET') {
-    sendJson(res, 200, {
-      total: registry.listRules().length,
-      data: registry.listRules().map(summarizeRule),
+    requireAuth(req, res, adminAuth, () => {
+      sendJson(res, 200, {
+        total: registry.listRules().length,
+        data: registry.listRules().map(summarizeRule),
+      });
     });
     return;
   }
 
   if (matchId && method === 'GET') {
-    const rule = registry.getRule(matchId[1]);
-    if (!rule) { sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Rule not found' } }); return; }
-    sendJson(res, 200, { data: rule });
+    requireAuth(req, res, adminAuth, () => {
+      const rule = registry.getRule(matchId[1]);
+      if (!rule) { sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Rule not found' } }); return; }
+      sendJson(res, 200, { data: rule });
+    });
     return;
   }
 
   if (path === '/admin/rules' && method === 'POST') {
-    try {
-      const input = (await readJsonBody(req)) as RuleCreateInput;
-      const rule = registry.addRule(input);
-      sendJson(res, 201, {
-        message: 'Rule created successfully. New requests will immediately use this rule.',
-        data: summarizeRule(rule),
-      });
-    } catch (e: any) {
-      sendJson(res, 400, { error: { code: 'VALIDATION_ERROR', message: e.message } });
-    }
+    requireAuth(req, res, adminAuth, async (actor, ip) => {
+      try {
+        const input = (await readJsonBody(req)) as RuleCreateInput;
+        const rule = registry.addRule(input, actor, ip);
+        sendJson(res, 201, {
+          message: 'Rule created successfully. New requests will immediately use this rule.',
+          data: summarizeRule(rule),
+        });
+      } catch (e: any) {
+        sendJson(res, 400, { error: { code: 'VALIDATION_ERROR', message: e.message } });
+      }
+    });
     return;
   }
 
   if (matchId && method === 'PUT') {
-    try {
-      const input = (await readJsonBody(req)) as RuleUpdateInput;
-      const rule = registry.updateRule(matchId[1], input);
-      sendJson(res, 200, {
-        message: 'Rule updated. New requests use new rules; existing WebSocket connections are NOT interrupted.',
-        data: summarizeRule(rule),
-        note: 'Active WebSocket streams continue with old routing until reconnected. HTTP/gRPC are stateless and pick up changes immediately.',
-      });
-    } catch (e: any) {
-      sendJson(res, e.message.includes('not found') ? 404 : 400,
-        { error: { code: e.message.includes('not found') ? 'NOT_FOUND' : 'VALIDATION_ERROR', message: e.message } });
-    }
+    requireAuth(req, res, adminAuth, async (actor, ip) => {
+      try {
+        const input = (await readJsonBody(req)) as RuleUpdateInput;
+        const rule = registry.updateRule(matchId[1], input, actor, ip);
+        sendJson(res, 200, {
+          message: 'Rule updated. New requests use new rules; existing WebSocket connections are NOT interrupted.',
+          data: summarizeRule(rule),
+          note: 'Active WebSocket streams continue with old routing until reconnected. HTTP/gRPC are stateless and pick up changes immediately.',
+        });
+      } catch (e: any) {
+        sendJson(res, e.message.includes('not found') ? 404 : 400,
+          { error: { code: e.message.includes('not found') ? 'NOT_FOUND' : 'VALIDATION_ERROR', message: e.message } });
+      }
+    });
     return;
   }
 
   if (matchId && method === 'DELETE') {
-    const deleted = registry.deleteRule(matchId[1]);
-    if (!deleted) { sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Rule not found' } }); return; }
-    sendJson(res, 200, {
-      message: 'Rule deleted. Existing connections will continue until they close.',
-      deletedRuleId: matchId[1],
+    requireAuth(req, res, adminAuth, (actor, ip) => {
+      const deleted = registry.deleteRule(matchId[1], actor, ip);
+      if (!deleted) { sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Rule not found' } }); return; }
+      sendJson(res, 200, {
+        message: 'Rule deleted. Existing connections will continue until they close.',
+        deletedRuleId: matchId[1],
+      });
     });
     return;
   }
 
   if (matchEnable && method === 'PATCH') {
-    try {
-      const enabled = matchEnable[2] === 'enable';
-      const rule = registry.setRuleEnabled(matchEnable[1], enabled);
+    requireAuth(req, res, adminAuth, (actor, ip) => {
+      try {
+        const enabled = matchEnable[2] === 'enable';
+        const rule = registry.setRuleEnabled(matchEnable[1], enabled, actor, ip);
+        sendJson(res, 200, {
+          message: `Rule ${enabled ? 'enabled' : 'disabled'}`,
+          data: summarizeRule(rule),
+          note: enabled
+            ? 'New requests will now match this rule.'
+            : 'Existing connections (incl. WebSocket) will continue until they close.',
+        });
+      } catch (e: any) {
+        sendJson(res, 404, { error: { code: 'NOT_FOUND', message: e.message } });
+      }
+    });
+    return;
+  }
+
+  if (matchVersions && method === 'GET') {
+    requireAuth(req, res, adminAuth, () => {
+      const ruleId = matchVersions[1];
+      const rule = registry.getRule(ruleId);
+      if (!rule) { sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Rule not found' } }); return; }
+      const versions = registry.listVersions(ruleId);
       sendJson(res, 200, {
-        message: `Rule ${enabled ? 'enabled' : 'disabled'}`,
-        data: summarizeRule(rule),
-        note: enabled
-          ? 'New requests will now match this rule.'
-          : 'Existing connections (incl. WebSocket) will continue until they close.',
+        ruleId,
+        currentVersion: rule.version,
+        total: versions.length,
+        versions: versions.map((v) => ({
+          id: v.id,
+          version: v.version,
+          createdAt: v.createdAt,
+          createdBy: v.createdBy,
+          note: v.note,
+        })),
       });
-    } catch (e: any) {
-      sendJson(res, 404, { error: { code: 'NOT_FOUND', message: e.message } });
-    }
+    });
+    return;
+  }
+
+  if (matchVersions && method === 'POST') {
+    requireAuth(req, res, adminAuth, async (actor, ip) => {
+      try {
+        const ruleId = matchVersions[1];
+        const body = await readJsonBody(req);
+        const version = registry.createVersion(ruleId, actor, body?.note, ip);
+        sendJson(res, 201, {
+          message: 'Version created',
+          data: {
+            id: version.id,
+            version: version.version,
+            createdAt: version.createdAt,
+            createdBy: version.createdBy,
+            note: version.note,
+          },
+        });
+      } catch (e: any) {
+        sendJson(res, e.message.includes('not found') ? 404 : 400,
+          { error: { code: e.message.includes('not found') ? 'NOT_FOUND' : 'VALIDATION_ERROR', message: e.message } });
+      }
+    });
+    return;
+  }
+
+  if (matchRollback && method === 'POST') {
+    requireAuth(req, res, adminAuth, (actor, ip) => {
+      try {
+        const ruleId = matchRollback[1];
+        const versionId = matchRollback[2];
+        const rule = registry.rollbackToVersion(ruleId, versionId, actor, ip);
+        sendJson(res, 200, {
+          message: 'Rule rolled back. New requests immediately use the rolled-back configuration.',
+          data: summarizeRule(rule),
+          note: 'Existing connections (incl. WebSocket) will continue until they close with old routing.',
+        });
+      } catch (e: any) {
+        sendJson(res, e.message.includes('not found') ? 404 : 400,
+          { error: { code: e.message.includes('not found') ? 'NOT_FOUND' : 'VALIDATION_ERROR', message: e.message } });
+      }
+    });
+    return;
+  }
+
+  if (matchGray && method === 'GET') {
+    requireAuth(req, res, adminAuth, () => {
+      const rule = registry.getRule(matchGray[1]);
+      if (!rule) { sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Rule not found' } }); return; }
+      sendJson(res, 200, {
+        ruleId: rule.id,
+        defaultTarget: {
+          backendAddress: rule.target.backendAddress,
+          serviceName: rule.target.serviceName,
+          methodName: rule.target.methodName,
+        },
+        grayTargets: rule.grayTargets || [],
+      });
+    });
+    return;
+  }
+
+  if (matchGray && method === 'PUT') {
+    requireAuth(req, res, adminAuth, async (actor, ip) => {
+      try {
+        const ruleId = matchGray[1];
+        const body = await readJsonBody(req);
+        const grayTargets = (body.grayTargets || []) as GrayTarget[];
+        const rule = registry.updateGrayTargets(ruleId, grayTargets, actor, ip);
+        sendJson(res, 200, {
+          message: 'Gray targets updated. Traffic will be split according to weights.',
+          data: {
+            ruleId: rule.id,
+            version: rule.version,
+            grayTargets: rule.grayTargets || [],
+          },
+          note: 'Weight is integer percentage. Total of all gray target weights + default = 100%.',
+        });
+      } catch (e: any) {
+        sendJson(res, e.message.includes('not found') ? 404 : 400,
+          { error: { code: e.message.includes('not found') ? 'NOT_FOUND' : 'VALIDATION_ERROR', message: e.message } });
+      }
+    });
     return;
   }
 
@@ -336,6 +516,7 @@ function summarizeRule(r: BusinessRule): any {
     id: r.id,
     name: r.name,
     description: r.description,
+    version: r.version,
     enabled: r.enabled,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
@@ -345,6 +526,7 @@ function summarizeRule(r: BusinessRule): any {
       protocol: r.target.protocol,
       isServerStreaming: r.target.isServerStreaming,
     },
+    grayTargets: r.grayTargets || [],
     endpoints: r.endpoints.map((ep) => {
       if (ep.protocol === Protocol.HTTP) {
         return { protocol: 'http', pattern: ep.pattern, methods: ep.methods };
@@ -364,17 +546,29 @@ function handleAdminMetrics(
   connMgr: ConnectionManager,
   wsHandler: WsHandler
 ): void {
-  const url = req.url || '';
   const byRule = registry.getAggregatedMetricsByRule();
-  const byProtocol = registry.getMetrics().reduce((acc, m) => {
-    if (!acc[m.protocol]) acc[m.protocol] = { requests: 0, errors: 0, avgLatencyMs: 0, active: 0 };
-    const p = acc[m.protocol];
-    p.requests += m.requests;
-    p.errors += m.errors;
-    p.active += m.activeConnections;
-    p.avgLatencyMs = Math.round((p.avgLatencyMs * (p.requests - m.requests) + m.totalLatencyMs) / Math.max(1, p.requests));
-    return acc;
-  }, {} as Record<string, any>);
+  const summaryByProtocol: Record<string, any> = {};
+
+  for (const rule of byRule) {
+    for (const [proto, m] of Object.entries(rule.byProtocol)) {
+      if (!summaryByProtocol[proto]) {
+        summaryByProtocol[proto] = { requests: 0, errors: 0, avgLatencyMs: 0, active: 0 };
+      }
+      const p = summaryByProtocol[proto];
+      p.requests += m.requests;
+      p.errors += m.errors;
+      p.active += m.activeConnections;
+    }
+  }
+
+  for (const p of Object.values(summaryByProtocol)) {
+    p.avgLatencyMs = p.requests > 0
+      ? Math.round(byRule.reduce((sum, r) => {
+          const protoM = r.byProtocol[Object.keys(summaryByProtocol).find(k => summaryByProtocol[k] === p) || ''];
+          return sum + (protoM ? protoM.avgLatencyMs * protoM.requests : 0);
+        }, 0) / p.requests)
+      : 0;
+  }
 
   const output = {
     generatedAt: new Date().toISOString(),
@@ -382,46 +576,38 @@ function handleAdminMetrics(
     summary: {
       totalRequests: byRule.reduce((s, r) => s + r.totalRequests, 0),
       totalErrors: byRule.reduce((s, r) => s + r.totalErrors, 0),
-      byProtocol,
+      byProtocol: summaryByProtocol,
       connections: connMgr.getCountsByProtocol(),
       limits: connMgr.getLimitsByProtocol(),
       webSocketConnections: wsHandler.getBindingStats(),
     },
-    rules: byRule.map((r) => {
-      const metric = registry.getMetricsByRuleId(r.ruleId);
-      return {
-        rule: {
-          id: r.ruleId,
-          name: r.ruleName,
-          enabled: r.enabled,
-          endpoints: r.endpoints,
-        },
-        metrics: {
-          totalRequests: r.totalRequests,
-          totalErrors: r.totalErrors,
-          avgLatencyMs: r.avgLatencyMs,
-          byProtocol: Object.fromEntries(
-            Object.entries(r.protocols).map(([p, m]) => [p, {
-              requests: m.requests,
-              errors: m.errors,
-              avgLatencyMs: m.requests > 0 ? Math.round(m.totalLatencyMs / m.requests) : 0,
-              p99LatencyMs: m.p99LatencyMs,
-              activeConnections: m.activeConnections,
-              lastRequestAt: m.lastRequestAt,
-              lastError: m.errors > 0 ? { at: m.lastErrorAt, message: m.lastErrorMessage } : null,
-            }])
-          ),
-          perEndpoint: metric.map(m => ({
-            protocol: m.protocol,
+    rules: byRule.map((r) => ({
+      rule: {
+        id: r.ruleId,
+        name: r.ruleName,
+        version: r.version,
+        enabled: r.enabled,
+        endpoints: r.endpoints,
+        grayTargets: r.grayTargets,
+      },
+      metrics: {
+        totalRequests: r.totalRequests,
+        totalErrors: r.totalErrors,
+        avgLatencyMs: r.avgLatencyMs,
+        byProtocol: Object.fromEntries(
+          Object.entries(r.byProtocol).map(([proto, m]) => [proto, {
             requests: m.requests,
             errors: m.errors,
-            avgLatencyMs: m.requests > 0 ? Math.round(m.totalLatencyMs / m.requests) : 0,
+            avgLatencyMs: m.avgLatencyMs,
             p99LatencyMs: m.p99LatencyMs,
             activeConnections: m.activeConnections,
-          })),
-        },
-      };
-    }),
+            lastRequestAt: m.lastRequestAt,
+            lastError: m.lastError,
+            byTarget: Object.values(m.byTarget),
+          }])
+        ),
+      },
+    })),
   };
 
   sendJson(res, 200, output);
@@ -446,17 +632,19 @@ function handleStats(
     routes: byRule.map((r) => ({
       ruleId: r.ruleId,
       ruleName: r.ruleName,
+      version: r.version,
       enabled: r.enabled,
+      grayTargets: r.grayTargets,
       endpoints: r.endpoints,
       metrics: {
         totalRequests: r.totalRequests,
         totalErrors: r.totalErrors,
         avgLatencyMs: r.avgLatencyMs,
         byProtocol: Object.fromEntries(
-          Object.entries(r.protocols).map(([p, m]) => [p, {
+          Object.entries(r.byProtocol).map(([proto, m]) => [proto, {
             requests: m.requests,
             errors: m.errors,
-            avgLatencyMs: m.requests > 0 ? Math.round(m.totalLatencyMs / m.requests) : 0,
+            avgLatencyMs: m.avgLatencyMs,
             p99LatencyMs: m.p99LatencyMs,
             activeConnections: m.activeConnections,
           }])
@@ -511,8 +699,20 @@ function handleAdminConnections(
     return;
   }
 
-  const allConns = Array.from({ length: 0 });
-  const wsStats = wsHandler.getBindingStats();
+  const result: any[] = [];
+  for (const protocol of Object.values(Protocol)) {
+    for (const c of connMgr.getByProtocol(protocol)) {
+      result.push({
+        id: c.id,
+        protocol: c.protocol,
+        remoteAddress: c.remoteAddress,
+        ruleId: c.ruleId,
+        connectedAt: c.connectedAt,
+        lastActivity: c.lastActivity,
+        durationMs: Date.now() - c.connectedAt.getTime(),
+      });
+    }
+  }
 
   sendJson(res, 200, {
     total: connMgr.count,
@@ -523,26 +723,40 @@ function handleAdminConnections(
       [Protocol.WEBSOCKET]: connMgr.wsCount,
       [Protocol.GRPC]: connMgr.grpcCount,
     },
-    webSocketConnections: wsStats,
-    connections: Array.from(
-      (() => {
-        const result: any[] = [];
-        for (const protocol of Object.values(Protocol)) {
-          for (const c of connMgr.getByProtocol(protocol)) {
-            result.push({
-              id: c.id,
-              protocol: c.protocol,
-              remoteAddress: c.remoteAddress,
-              ruleId: c.ruleId,
-              connectedAt: c.connectedAt,
-              lastActivity: c.lastActivity,
-              durationMs: Date.now() - c.connectedAt.getTime(),
-            });
-          }
-        }
-        return result;
-      })()
-    ),
+    webSocketConnections: wsHandler.getBindingStats(),
+    connections: result,
+  });
+}
+
+function handleAdminAuditLogs(
+  req: IncomingMessage,
+  res: ServerResponse,
+  registry: RouteRegistry
+): void {
+  const url = req.url || '';
+  const path = extractPath(url);
+  
+  const urlObj = new URL(url, 'http://localhost');
+  const ruleId = urlObj.searchParams.get('ruleId') || undefined;
+  const action = urlObj.searchParams.get('action') || undefined;
+  const limit = parseInt(urlObj.searchParams.get('limit') || '100', 10);
+
+  const logs = registry.getAuditLogs(ruleId, action, Math.min(limit, 500));
+  
+  sendJson(res, 200, {
+    total: logs.length,
+    data: logs.map((log) => ({
+      id: log.id,
+      timestamp: log.timestamp,
+      action: log.action,
+      actor: log.actor,
+      ruleId: log.ruleId,
+      ruleName: log.ruleName,
+      ip: log.ip,
+      metadata: log.metadata,
+      hasBefore: !!log.before,
+      hasAfter: !!log.after,
+    })),
   });
 }
 

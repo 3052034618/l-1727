@@ -36,23 +36,6 @@ export interface GrpcEndpoint {
 
 export type ProtocolEndpoint = HttpEndpoint | WsEndpoint | GrpcEndpoint;
 
-export interface BusinessRule {
-  id: string;
-  name: string;
-  description?: string;
-  enabled: boolean;
-  createdAt: string;
-  updatedAt: string;
-  target: {
-    protocol: Protocol;
-    backendAddress: string;
-    serviceName: string;
-    methodName: string;
-    isServerStreaming: boolean;
-  };
-  endpoints: ProtocolEndpoint[];
-}
-
 export interface Route {
   ruleId: string;
   ruleName: string;
@@ -83,6 +66,7 @@ export interface RequestContext {
   body: any;
   rawBody: Buffer | null;
   matchedRuleId?: string;
+  grayTargetName?: string;
 }
 
 export interface BackendResponse {
@@ -156,4 +140,72 @@ export interface RuleUpdateInput {
     isServerStreaming: boolean;
   };
   endpoints?: ProtocolEndpoint[];
+}
+
+export interface GrayTarget {
+  name: string;
+  weight: number;
+  backendAddress: string;
+  serviceName?: string;
+  methodName?: string;
+}
+
+export interface BusinessRule {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  version: string;
+  target: {
+    protocol: Protocol;
+    backendAddress: string;
+    serviceName: string;
+    methodName: string;
+    isServerStreaming: boolean;
+  };
+  grayTargets?: GrayTarget[];
+  endpoints: ProtocolEndpoint[];
+}
+
+export interface RuleVersion {
+  id: string;
+  ruleId: string;
+  version: string;
+  ruleSnapshot: BusinessRule;
+  createdAt: string;
+  createdBy: string;
+  note?: string;
+}
+
+export enum AuditAction {
+  RULE_CREATED = 'rule.created',
+  RULE_UPDATED = 'rule.updated',
+  RULE_DELETED = 'rule.deleted',
+  RULE_ENABLED = 'rule.enabled',
+  RULE_DISABLED = 'rule.disabled',
+  RULE_ROLLED_BACK = 'rule.rolled_back',
+  VERSION_CREATED = 'version.created',
+  GRAY_UPDATED = 'gray.updated',
+}
+
+export interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  action: AuditAction;
+  actor: string;
+  ruleId: string;
+  ruleName: string;
+  before?: any;
+  after?: any;
+  metadata?: Record<string, any>;
+  ip?: string;
+}
+
+export interface AdminConfig {
+  enabled: boolean;
+  tokens: string[];
+  tokenHeader: string;
+  auditLogMaxEntries: number;
 }

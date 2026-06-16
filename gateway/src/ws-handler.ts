@@ -5,6 +5,7 @@ import { UnifiedRouter } from './router';
 import { ProtocolConverter } from './converter';
 import { GrpcClientPool } from './grpc-client-pool';
 import { ConnectionManager } from './connection-manager';
+import { RouteRegistry } from './route-registry';
 
 interface WsRouteBinding {
   route: Route;
@@ -12,6 +13,7 @@ interface WsRouteBinding {
   wsConnection: WebSocket;
   connectionId: string | null;
   topic: string;
+  startTime: number;
 }
 
 export class WsHandler {
@@ -19,16 +21,19 @@ export class WsHandler {
   private router: UnifiedRouter;
   private grpcPool: GrpcClientPool;
   private connectionManager: ConnectionManager;
+  private registry: RouteRegistry;
   private bindings: Map<WebSocket, WsRouteBinding> = new Map();
 
   constructor(
     router: UnifiedRouter,
     grpcPool: GrpcClientPool,
-    connectionManager: ConnectionManager
+    connectionManager: ConnectionManager,
+    registry: RouteRegistry
   ) {
     this.router = router;
     this.grpcPool = grpcPool;
     this.connectionManager = connectionManager;
+    this.registry = registry;
     this.wss = new WebSocketServer({ noServer: true });
     this.setupWss();
   }
@@ -57,7 +62,7 @@ export class WsHandler {
 
     const route = this.router.match(ctx);
     if (!route) {
-      socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+      socket.write('HTTP/1.1 404 Not Found\r\nX-Gateway-Error: 1\r\nContent-Type: application/json\r\n\r\n{"error":{"code":"ROUTE_NOT_FOUND","message":"No route found for WebSocket","path":"' + path + '"}}');
       socket.destroy();
       console.log(`[WS] Upgrade rejected: no route for ${path}`);
       return;
@@ -92,23 +97,35 @@ export class WsHandler {
     );
 
     if (connResult instanceof Error) {
-      ws.close(1013, connResult.message);
+      const limits = this.connectionManager.getLimitsByProtocol();
+      ws.close(1013, JSON.stringify({
+        type: 'error',
+        error: {
+          code: 'WS_QUOTA_EXCEEDED',
+          message: connResult.message,
+          limits: limits.websocket,
+          retryAfterSeconds: 10,
+        },
+      }));
       return;
     }
 
     const connectionId = connResult.id;
+    this.registry.incrementActive(route.ruleId, Protocol.WEBSOCKET);
+
+    const topicParam = route.topicQueryParam || 'topic';
     const binding: WsRouteBinding = {
       route,
       grpcStream: null,
       wsConnection: ws,
       connectionId,
-      topic: ctx.query.topic || 'default',
+      topic: ctx.query[topicParam] || 'default',
+      startTime: Date.now(),
     };
     this.bindings.set(ws, binding);
 
     console.log(
-      `[WS] Client connected: ${remoteAddr} -> ${route.serviceName}/${route.methodName} ` +
-      `(topic: ${binding.topic}, connId: ${connectionId})`
+      `[WS] Connected: ${remoteAddr} -> rule=${route.ruleId} connId=${connectionId} topic=${binding.topic}`
     );
 
     if (route.targetProtocol === Protocol.GRPC && route.isServerStreaming) {
@@ -120,14 +137,19 @@ export class WsHandler {
     });
 
     ws.on('close', (code: number, reason: Buffer) => {
-      console.log(`[WS] Client disconnected: ${connectionId}, code: ${code}`);
+      const duration = Date.now() - binding.startTime;
+      this.registry.recordRequest(route.ruleId, Protocol.WEBSOCKET, duration, false);
+      console.log(`[WS] Disconnected: ${connectionId}, code=${code}, duration=${duration}ms`);
       this.cleanupBinding(ws);
+      this.registry.decrementActive(route.ruleId, Protocol.WEBSOCKET);
       this.connectionManager.unregister(connectionId);
     });
 
     ws.on('error', (err: Error) => {
       console.error(`[WS] Error on ${connectionId}:`, err.message);
+      this.registry.recordRequest(route.ruleId, Protocol.WEBSOCKET, Date.now() - binding.startTime, true, err.message);
       this.cleanupBinding(ws);
+      this.registry.decrementActive(route.ruleId, Protocol.WEBSOCKET);
       this.connectionManager.unregister(connectionId);
     });
 
@@ -140,8 +162,12 @@ export class WsHandler {
       data: {
         connectionId,
         topic: binding.topic,
+        ruleId: route.ruleId,
+        ruleName: route.ruleName,
         service: route.serviceName,
         method: route.methodName,
+        isStreaming: route.isServerStreaming,
+        connectedAt: Date.now(),
       },
     }));
   }
@@ -168,6 +194,11 @@ export class WsHandler {
         ws.send(JSON.stringify({
           type: 'event',
           data: plainData,
+          meta: {
+            ruleId: binding.route.ruleId,
+            topic: binding.topic,
+            timestamp: Date.now(),
+          },
         }));
 
         if (binding.connectionId) {
@@ -177,27 +208,54 @@ export class WsHandler {
 
       stream.on('end', () => {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'stream_end', data: { reason: 'grpc_stream_completed' } }));
+          ws.send(JSON.stringify({
+            type: 'stream_end',
+            data: { reason: 'grpc_stream_completed', topic: binding.topic },
+          }));
         }
       });
 
       stream.on('error', (err: any) => {
-        console.error(`[WS] gRPC stream error for ${binding.connectionId}:`, err.message);
+        console.error(`[WS] gRPC stream error for ${binding.connectionId}:`, err.code, err.message);
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'error', data: { message: err.message } }));
+          ws.send(JSON.stringify({
+            type: 'error',
+            error: {
+              code: `GRPC_${err.code ?? 'STREAM_ERROR'}`,
+              grpcCode: err.code,
+              message: err.message,
+              details: err.details,
+              ruleId: binding.route.ruleId,
+              backend: binding.route.backendAddress,
+            },
+          }));
         }
+        binding.grpcStream = null;
       });
 
-      console.log(`[WS] gRPC stream bound: ${binding.route.serviceName}/${binding.route.methodName}`);
+      console.log(`[WS] gRPC stream bound: ${binding.route.ruleId}/${binding.route.methodName}, topic=${binding.topic}`);
     } catch (err: any) {
       console.error(`[WS] Failed to bind gRPC stream:`, err.message);
-      ws.send(JSON.stringify({ type: 'error', data: { message: 'Failed to connect to backend stream' } }));
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: {
+            code: 'BACKEND_CONNECT_FAILED',
+            message: 'Failed to connect to backend stream',
+            details: err.message,
+          },
+        }));
+      }
     }
   }
 
   private handleMessage(ws: WebSocket, binding: WsRouteBinding, data: Buffer, isBinary: boolean): void {
     if (isBinary) {
       console.warn(`[WS] Binary message not supported from ${binding.connectionId}`);
+      ws.send(JSON.stringify({
+        type: 'error',
+        error: { code: 'BINARY_NOT_SUPPORTED', message: 'Binary messages are not supported' },
+      }));
       return;
     }
 
@@ -206,7 +264,7 @@ export class WsHandler {
     try {
       parsed = JSON.parse(message);
     } catch {
-      parsed = { data: message };
+      parsed = { type: 'raw', data: message };
     }
 
     if (parsed.type === 'pong') {
@@ -219,18 +277,33 @@ export class WsHandler {
     if (parsed.type === 'subscribe' && parsed.topic) {
       binding.topic = parsed.topic;
       if (binding.grpcStream) {
-        binding.grpcStream.cancel();
+        try { binding.grpcStream.cancel(); } catch {}
+        binding.grpcStream = null;
       }
-      this.bindGrpcStream(ws, binding);
+      if (binding.route.isServerStreaming) {
+        this.bindGrpcStream(ws, binding);
+      }
+      ws.send(JSON.stringify({
+        type: 'subscribed',
+        data: { topic: binding.topic, ruleId: binding.route.ruleId },
+      }));
       return;
     }
 
     if (parsed.type === 'unsubscribe') {
       if (binding.grpcStream) {
-        binding.grpcStream.cancel();
+        try { binding.grpcStream.cancel(); } catch {}
         binding.grpcStream = null;
-        ws.send(JSON.stringify({ type: 'unsubscribed', data: { topic: binding.topic } }));
+        ws.send(JSON.stringify({
+          type: 'unsubscribed',
+          data: { topic: binding.topic, ruleId: binding.route.ruleId },
+        }));
       }
+      return;
+    }
+
+    if (parsed.type === 'ping') {
+      ws.send(JSON.stringify({ type: 'pong', serverTime: Date.now() }));
       return;
     }
 
@@ -240,6 +313,10 @@ export class WsHandler {
   }
 
   private async forwardWsToGrpcUnary(ws: WebSocket, binding: WsRouteBinding, message: any): Promise<void> {
+    const reqStart = Date.now();
+    let isError = false;
+    let errMsg: string | undefined;
+
     try {
       const payload = ProtocolConverter.wsMessageToGrpcPayload(message, binding.route);
       const response = await this.grpcPool.makeUnaryCall(
@@ -251,12 +328,40 @@ export class WsHandler {
 
       if (ws.readyState === WebSocket.OPEN) {
         const plainResponse = ProtocolConverter.protobufToPlainObject(response);
-        ws.send(JSON.stringify({ type: 'response', data: plainResponse }));
+        ws.send(JSON.stringify({
+          type: 'response',
+          data: plainResponse,
+          meta: {
+            ruleId: binding.route.ruleId,
+            method: binding.route.methodName,
+            latencyMs: Date.now() - reqStart,
+          },
+        }));
       }
     } catch (err: any) {
+      isError = true;
+      errMsg = err.message;
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'error', data: { message: err.message, code: err.code } }));
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: {
+            code: `GRPC_${err.code ?? 'CALL_ERROR'}`,
+            grpcCode: err.code,
+            message: err.message,
+            details: err.details,
+            ruleId: binding.route.ruleId,
+            backend: binding.route.backendAddress,
+          },
+        }));
       }
+    } finally {
+      this.registry.recordRequest(
+        binding.route.ruleId,
+        Protocol.WEBSOCKET,
+        Date.now() - reqStart,
+        isError,
+        errMsg
+      );
     }
   }
 
@@ -275,10 +380,51 @@ export class WsHandler {
     return this.bindings.size;
   }
 
+  getBindingsByRuleId(ruleId: string): WsRouteBinding[] {
+    const result: WsRouteBinding[] = [];
+    for (const binding of this.bindings.values()) {
+      if (binding.route.ruleId === ruleId) {
+        result.push(binding);
+      }
+    }
+    return result;
+  }
+
+  getBindingStats(): Array<{
+    ruleId: string;
+    ruleName: string;
+    topic: string;
+    durationMs: number;
+    connectionId: string;
+  }> {
+    const now = Date.now();
+    const result: Array<{
+      ruleId: string;
+      ruleName: string;
+      topic: string;
+      durationMs: number;
+      connectionId: string;
+    }> = [];
+    for (const binding of this.bindings.values()) {
+      result.push({
+        ruleId: binding.route.ruleId,
+        ruleName: binding.route.ruleName,
+        topic: binding.topic,
+        durationMs: now - binding.startTime,
+        connectionId: binding.connectionId || 'unknown',
+      });
+    }
+    return result;
+  }
+
   broadcast(topic: string, data: any): void {
     for (const [, binding] of this.bindings) {
       if (binding.topic === topic && binding.wsConnection.readyState === WebSocket.OPEN) {
-        binding.wsConnection.send(JSON.stringify({ type: 'broadcast', data }));
+        binding.wsConnection.send(JSON.stringify({
+          type: 'broadcast',
+          data,
+          meta: { topic, broadcastAt: Date.now() },
+        }));
       }
     }
   }
@@ -287,7 +433,11 @@ export class WsHandler {
     for (const [ws, binding] of this.bindings) {
       this.cleanupBinding(ws);
       if (ws.readyState === WebSocket.OPEN) {
-        ws.close(1001, 'Server shutting down');
+        ws.close(1001, JSON.stringify({
+          type: 'close',
+          reason: 'server_shutdown',
+          message: 'Gateway is shutting down gracefully',
+        }));
       }
     }
     this.wss.close();

@@ -7,6 +7,7 @@ interface ConnectionEvents {
   disconnected: (id: ConnectionId) => void;
   message: (id: ConnectionId, data: any) => void;
   error: (id: ConnectionId, err: Error) => void;
+  limitExceeded: (protocol: Protocol, limit: number, count: number) => void;
 }
 
 declare interface ConnectionManager {
@@ -17,14 +18,39 @@ declare interface ConnectionManager {
 class ConnectionManager extends EventEmitter {
   private connections: Map<ConnectionId, ManagedConnection> = new Map();
   private heartbeatTimers: Map<ConnectionId, NodeJS.Timeout> = new Map();
-  private maxConnections: number;
+  private protocolLimits: Map<Protocol, number> = new Map();
   private heartbeatIntervalMs: number;
   private shuttingDown: boolean = false;
 
-  constructor(maxConnections: number = 1000, heartbeatIntervalMs: number = 30000) {
+  constructor(
+    opts: {
+      wsMaxConnections?: number;
+      httpMaxStreams?: number;
+      grpcMaxStreams?: number;
+      heartbeatIntervalMs?: number;
+    } = {}
+  ) {
     super();
-    this.maxConnections = maxConnections;
-    this.heartbeatIntervalMs = heartbeatIntervalMs;
+    this.protocolLimits.set(Protocol.WEBSOCKET, opts.wsMaxConnections ?? 1000);
+    this.protocolLimits.set(Protocol.HTTP, opts.httpMaxStreams ?? 500);
+    this.protocolLimits.set(Protocol.GRPC, opts.grpcMaxStreams ?? 500);
+    this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 30000;
+  }
+
+  setProtocolLimit(protocol: Protocol, limit: number): void {
+    this.protocolLimits.set(protocol, limit);
+  }
+
+  getProtocolLimit(protocol: Protocol): number {
+    return this.protocolLimits.get(protocol) ?? Infinity;
+  }
+
+  getProtocolCount(protocol: Protocol): number {
+    let count = 0;
+    for (const conn of this.connections.values()) {
+      if (conn.protocol === protocol) count++;
+    }
+    return count;
   }
 
   register(
@@ -38,8 +64,16 @@ class ConnectionManager extends EventEmitter {
       return new Error('Gateway is shutting down, refusing new connections');
     }
 
-    if (this.connections.size >= this.maxConnections) {
-      return new Error(`Maximum connections (${this.maxConnections}) reached`);
+    const limit = this.protocolLimits.get(protocol);
+    if (limit !== undefined && limit !== Infinity) {
+      const currentCount = this.getProtocolCount(protocol);
+      if (currentCount >= limit) {
+        this.emit('limitExceeded', protocol, limit, currentCount);
+        return new Error(
+          `Maximum ${protocol} connections/streams (${limit}) reached. ` +
+          `Current active: ${currentCount}. Please try again later.`
+        );
+      }
     }
 
     const id: ConnectionId = uuidv4();
@@ -50,6 +84,7 @@ class ConnectionManager extends EventEmitter {
       connectedAt: new Date(),
       lastActivity: new Date(),
       route: route ?? null,
+      ruleId: route?.ruleId,
       send,
       close,
     };
@@ -91,16 +126,52 @@ class ConnectionManager extends EventEmitter {
     return result;
   }
 
+  getConnectionsByRuleId(ruleId: string): ManagedConnection[] {
+    const result: ManagedConnection[] = [];
+    for (const conn of this.connections.values()) {
+      if (conn.ruleId === ruleId) {
+        result.push(conn);
+      }
+    }
+    return result;
+  }
+
   get count(): number {
     return this.connections.size;
   }
 
   get wsCount(): number {
-    let count = 0;
-    for (const conn of this.connections.values()) {
-      if (conn.protocol === Protocol.WEBSOCKET) count++;
+    return this.getProtocolCount(Protocol.WEBSOCKET);
+  }
+
+  get httpCount(): number {
+    return this.getProtocolCount(Protocol.HTTP);
+  }
+
+  get grpcCount(): number {
+    return this.getProtocolCount(Protocol.GRPC);
+  }
+
+  getCountsByProtocol(): Record<string, number> {
+    return {
+      [Protocol.HTTP]: this.httpCount,
+      [Protocol.WEBSOCKET]: this.wsCount,
+      [Protocol.GRPC]: this.grpcCount,
+    };
+  }
+
+  getLimitsByProtocol(): Record<string, { limit: number; current: number; available: number }> {
+    const result: Record<string, { limit: number; current: number; available: number }> = {};
+    for (const protocol of Object.values(Protocol)) {
+      const limit = this.getProtocolLimit(protocol);
+      const current = this.getProtocolCount(protocol);
+      result[protocol] = {
+        limit,
+        current,
+        available: limit - current,
+      };
     }
-    return count;
+    return result;
   }
 
   broadcast(protocol: Protocol, data: any, filter?: (conn: ManagedConnection) => boolean): void {

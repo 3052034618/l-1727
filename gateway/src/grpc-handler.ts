@@ -1,26 +1,29 @@
 import * as grpc from '@grpc/grpc-js';
-import { Protocol, Route, RequestContext } from './types';
+import { Protocol, Route } from './types';
 import { UnifiedRouter } from './router';
 import { GrpcClientPool } from './grpc-client-pool';
 import { ConnectionManager } from './connection-manager';
-import { ProtocolConverter } from './converter';
+import { RouteRegistry } from './route-registry';
 
 export class GrpcHandler {
   private server: grpc.Server;
   private router: UnifiedRouter;
   private grpcPool: GrpcClientPool;
   private connectionManager: ConnectionManager;
+  private registry: RouteRegistry;
   private protoPath: string;
 
   constructor(
     router: UnifiedRouter,
     grpcPool: GrpcClientPool,
     connectionManager: ConnectionManager,
+    registry: RouteRegistry,
     protoPath: string
   ) {
     this.router = router;
     this.grpcPool = grpcPool;
     this.connectionManager = connectionManager;
+    this.registry = registry;
     this.protoPath = protoPath;
     this.server = new grpc.Server({
       'grpc.max_receive_message_length': 4 * 1024 * 1024,
@@ -51,90 +54,91 @@ export class GrpcHandler {
     const implementations: Record<string, grpc.handleUnaryCall<any, any> | grpc.handleServerStreamingCall<any, any>> = {};
 
     for (const [methodName, methodDef] of Object.entries(serviceDef)) {
-      const fullMethodName = (methodDef as any).originalName || methodName;
-      const serviceName = 'gateway.UserService';
-
-      const route = this.router.findRouteByServiceMethod(serviceName, methodName);
-      if (!route) {
-        console.warn(`[gRPC] No route found for ${serviceName}/${methodName}, using pass-through`);
-      }
-
-      if ((methodDef as any).requestStream) {
-        continue;
-      }
+      if ((methodDef as any).requestStream) continue;
 
       if ((methodDef as any).responseStream) {
-        implementations[methodName] = this.createServerStreamingHandler(serviceName, methodName, route);
+        implementations[methodName] = this.createServerStreamingHandler(methodName);
       } else {
-        implementations[methodName] = this.createUnaryHandler(serviceName, methodName, route);
+        implementations[methodName] = this.createUnaryHandler(methodName);
       }
     }
 
     this.server.addService(serviceDef, implementations);
-    console.log('[gRPC] Service handlers registered');
+    console.log('[gRPC] Service handlers registered for gateway.UserService');
   }
 
   private createUnaryHandler(
-    serviceName: string,
-    methodName: string,
-    route: Route | null
+    methodName: string
   ): grpc.handleUnaryCall<any, any> {
     return async (call: grpc.ServerUnaryCall<any, any>, callback: grpc.sendUnaryData<any>) => {
       const startTime = Date.now();
+      const serviceName = 'gateway.UserService';
       const grpcPath = `/${serviceName}/${methodName}`;
 
+      const route = this.router.findRouteByServiceMethod(serviceName, methodName);
+      if (!route) {
+        this.registry.recordRequest('__unrouted__', Protocol.GRPC, Date.now() - startTime, true, `No route for ${grpcPath}`);
+        callback({
+          code: grpc.status.UNIMPLEMENTED,
+          message: `Method ${grpcPath} not routed`,
+        } as grpc.ServiceError);
+        return;
+      }
+
+      if (route.targetProtocol !== Protocol.GRPC) {
+        this.registry.recordRequest(route.ruleId, Protocol.GRPC, Date.now() - startTime, true,
+          `Target protocol ${route.targetProtocol} not supported for gRPC source`);
+        callback({
+          code: grpc.status.UNIMPLEMENTED,
+          message: `Target protocol ${route.targetProtocol} not supported for gRPC source`,
+        } as grpc.ServiceError);
+        return;
+      }
+
+      const payload = call.request;
+      let isError = false;
+      let errMsg: string | undefined;
+
       try {
-        console.log(`[gRPC] Incoming: ${grpcPath}`);
+        this.registry.incrementActive(route.ruleId, Protocol.GRPC);
+        const response = await this.grpcPool.makeUnaryCall(
+          route.backendAddress,
+          route.serviceName,
+          route.methodName,
+          payload
+        );
 
-        if (!route) {
-          callback({
-            code: grpc.status.UNIMPLEMENTED,
-            message: `Method ${grpcPath} not routed`,
-          } as grpc.ServiceError);
-          return;
-        }
-
-        const payload = call.request;
-
-        if (route.targetProtocol === Protocol.GRPC) {
-          const response = await this.grpcPool.makeUnaryCall(
-            route.backendAddress,
-            route.serviceName,
-            route.methodName,
-            payload
-          );
-
-          const duration = Date.now() - startTime;
-          console.log(`[gRPC] ${grpcPath} -> ${route.backendAddress} ${duration}ms`);
-          callback(null, response);
-        } else {
-          callback({
-            code: grpc.status.UNIMPLEMENTED,
-            message: `Target protocol ${route.targetProtocol} not supported for gRPC source`,
-          } as grpc.ServiceError);
-        }
+        const duration = Date.now() - startTime;
+        console.log(`[gRPC] ${grpcPath} -> ${route.ruleId} ${duration}ms`);
+        callback(null, response);
       } catch (err: any) {
-        console.error(`[gRPC] Error handling ${grpcPath}:`, err.message);
+        isError = true;
+        errMsg = err.message;
+        console.error(`[gRPC] Error handling ${grpcPath}:`, err.code, err.message);
         callback({
           code: err.code || grpc.status.INTERNAL,
           message: err.message,
+          details: err.details,
         } as grpc.ServiceError);
+      } finally {
+        this.registry.decrementActive(route.ruleId, Protocol.GRPC);
+        this.registry.recordRequest(route.ruleId, Protocol.GRPC, Date.now() - startTime, isError, errMsg);
       }
     };
   }
 
   private createServerStreamingHandler(
-    serviceName: string,
-    methodName: string,
-    route: Route | null
+    methodName: string
   ): grpc.handleServerStreamingCall<any, any> {
     return (call: grpc.ServerWritableStream<any, any>) => {
       const startTime = Date.now();
+      const serviceName = 'gateway.UserService';
       const grpcPath = `/${serviceName}/${methodName}`;
+      const peer = call.getPeer();
 
-      console.log(`[gRPC] Incoming stream: ${grpcPath}`);
-
+      const route = this.router.findRouteByServiceMethod(serviceName, methodName);
       if (!route) {
+        this.registry.recordRequest('__unrouted__', Protocol.GRPC, Date.now() - startTime, true, `No route for ${grpcPath}`);
         call.emit('error', {
           code: grpc.status.UNIMPLEMENTED,
           message: `Method ${grpcPath} not routed`,
@@ -142,22 +146,20 @@ export class GrpcHandler {
         return;
       }
 
-      const payload = call.request;
-      const remoteAddr = call.getPeer();
-
       const connResult = this.connectionManager.register(
         Protocol.GRPC,
-        remoteAddr,
+        peer,
         (data: any) => {
-          call.write(data);
+          try { call.write(data); } catch {}
         },
         () => {
-          call.end();
+          try { call.end(); } catch {}
         },
         route
       );
 
       if (connResult instanceof Error) {
+        this.registry.recordRequest(route.ruleId, Protocol.GRPC, Date.now() - startTime, true, connResult.message);
         call.emit('error', {
           code: grpc.status.RESOURCE_EXHAUSTED,
           message: connResult.message,
@@ -165,47 +167,85 @@ export class GrpcHandler {
         return;
       }
 
-      const connId = connResult.id;
+      const connectionId = connResult.id;
+      this.registry.incrementActive(route.ruleId, Protocol.GRPC);
+
+      let completed = false;
+      let isError = false;
+      let errMsg: string | undefined;
+
+      const finalize = () => {
+        if (completed) return;
+        completed = true;
+        this.registry.decrementActive(route.ruleId, Protocol.GRPC);
+        this.connectionManager.unregister(connectionId);
+        this.registry.recordRequest(route.ruleId, Protocol.GRPC, Date.now() - startTime, isError, errMsg);
+      };
 
       try {
+        console.log(`[gRPC] Stream started: ${grpcPath} for rule=${route.ruleId}`);
+
         const backendStream = this.grpcPool.makeServerStreamingCall(
           route.backendAddress,
           route.serviceName,
           route.methodName,
-          payload
+          call.request
         );
 
         backendStream.on('data', (chunk: any) => {
-          call.write(chunk);
-          this.connectionManager.updateActivity(connId);
+          try {
+            call.write(chunk);
+            this.connectionManager.updateActivity(connectionId);
+          } catch (writeErr: any) {
+            isError = true;
+            errMsg = `Write error: ${writeErr.message}`;
+            backendStream.cancel();
+          }
         });
 
         backendStream.on('end', () => {
-          this.connectionManager.unregister(connId);
-          call.end();
-          const duration = Date.now() - startTime;
-          console.log(`[gRPC] Stream ${grpcPath} completed ${duration}ms`);
+          if (!completed) {
+            const duration = Date.now() - startTime;
+            console.log(`[gRPC] Stream completed: ${grpcPath}, duration=${duration}ms`);
+            try { call.end(); } catch {}
+            finalize();
+          }
         });
 
         backendStream.on('error', (err: any) => {
-          console.error(`[gRPC] Stream error ${grpcPath}:`, err.message);
-          this.connectionManager.unregister(connId);
-          call.emit('error', {
-            code: err.code || grpc.status.INTERNAL,
-            message: err.message,
-          });
+          if (!completed) {
+            isError = true;
+            errMsg = err.message;
+            console.error(`[gRPC] Stream error ${grpcPath}: code=${err.code} msg=${err.message}`);
+            try {
+              call.emit('error', {
+                code: err.code || grpc.status.INTERNAL,
+                message: err.message,
+                details: err.details,
+              });
+            } catch {}
+            finalize();
+          }
         });
 
         call.on('cancelled', () => {
-          backendStream.cancel();
-          this.connectionManager.unregister(connId);
+          if (!completed) {
+            console.log(`[gRPC] Stream cancelled: ${grpcPath}`);
+            try { backendStream.cancel(); } catch {}
+            finalize();
+          }
         });
       } catch (err: any) {
-        this.connectionManager.unregister(connId);
-        call.emit('error', {
-          code: grpc.status.INTERNAL,
-          message: err.message,
-        });
+        isError = true;
+        errMsg = err.message;
+        console.error(`[gRPC] Failed to start stream ${grpcPath}:`, err.message);
+        try {
+          call.emit('error', {
+            code: grpc.status.INTERNAL,
+            message: err.message,
+          });
+        } catch {}
+        finalize();
       }
     };
   }
@@ -225,7 +265,7 @@ export class GrpcHandler {
       this.server.bindAsync(
         `0.0.0.0:${port}`,
         grpc.ServerCredentials.createInsecure(),
-        (err, port) => {
+        (err, boundPort) => {
           if (err) {
             reject(err);
             return;

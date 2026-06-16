@@ -1,103 +1,38 @@
 import { Protocol, HttpMethod, Route, RequestContext, PathParams } from './types';
-
-interface CompiledRoute {
-  route: Route;
-  regex: RegExp;
-  paramNames: string[];
-}
+import { RouteRegistry } from './route-registry';
 
 export class UnifiedRouter {
-  private compiledRoutes: CompiledRoute[] = [];
+  private registry: RouteRegistry;
 
-  constructor(routes: Route[]) {
-    for (const route of routes) {
-      const { regex, paramNames } = this.compilePattern(route.pattern);
-      this.compiledRoutes.push({ route, regex, paramNames });
-    }
+  constructor(registry: RouteRegistry) {
+    this.registry = registry;
   }
 
   match(ctx: RequestContext): Route | null {
-    for (const compiled of this.compiledRoutes) {
-      const { route, regex, paramNames } = compiled;
+    const paramsOut: { params: Record<string, string> } = { params: {} };
+    const ruleIdOut: { id?: string } = {};
 
-      if (route.sourceProtocol !== ctx.protocol) {
-        continue;
-      }
+    const route = this.registry.matchRoute(
+      ctx.protocol,
+      ctx.method,
+      ctx.path,
+      paramsOut,
+      ruleIdOut
+    );
 
-      if (ctx.protocol === Protocol.HTTP || ctx.protocol === Protocol.WEBSOCKET) {
-        if (!this.matchHttpRoute(route, ctx, regex, paramNames)) {
-          continue;
-        }
-        return route;
-      }
-
-      if (ctx.protocol === Protocol.GRPC) {
-        if (this.matchGrpcRoute(route, ctx)) {
-          return route;
-        }
-      }
-    }
-    return null;
-  }
-
-  private matchHttpRoute(
-    route: Route,
-    ctx: RequestContext,
-    regex: RegExp,
-    paramNames: string[]
-  ): boolean {
-    if (route.methods.length > 0 && !route.methods.includes(ctx.method)) {
-      return false;
+    if (route) {
+      ctx.params = paramsOut.params;
+      ctx.matchedRuleId = ruleIdOut.id;
     }
 
-    const match = ctx.path.match(regex);
-    if (!match) {
-      return false;
-    }
-
-    const params: PathParams = {};
-    for (let i = 0; i < paramNames.length; i++) {
-      params[paramNames[i]] = match[i + 1];
-    }
-    ctx.params = params;
-    return true;
-  }
-
-  private matchGrpcRoute(route: Route, ctx: RequestContext): boolean {
-    const grpcPath = `/${route.serviceName}/${route.methodName}`;
-    return ctx.path === grpcPath;
-  }
-
-  private compilePattern(pattern: string): { regex: RegExp; paramNames: string[] } {
-    const paramNames: string[] = [];
-    let regexStr = '^';
-
-    const parts = pattern.split('/');
-    for (const part of parts) {
-      if (!part) continue;
-      regexStr += '\\/';
-      if (part.startsWith(':')) {
-        const name = part.slice(1);
-        paramNames.push(name);
-        regexStr += '([^\\/]+)';
-      } else {
-        regexStr += part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      }
-    }
-
-    regexStr += '$';
-    return { regex: new RegExp(regexStr), paramNames };
+    return route;
   }
 
   findRouteByServiceMethod(serviceName: string, methodName: string): Route | null {
-    for (const compiled of this.compiledRoutes) {
-      if (
-        compiled.route.serviceName === serviceName &&
-        compiled.route.methodName === methodName
-      ) {
-        return compiled.route;
-      }
-    }
-    return null;
+    return this.registry.findRouteByServiceMethod(serviceName, methodName);
+  }
+
+  getAllRoutes(): Route[] {
+    return this.registry.getCompiledRoutes();
   }
 }

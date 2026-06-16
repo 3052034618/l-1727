@@ -1,0 +1,25 @@
+{
+  "name": "multi-protocol-gateway",
+  "version": "1.0.0",
+  "description": "Multi-protocol unified gateway supporting HTTP, WebSocket, and gRPC with protocol conversion",
+  "type": "commonjs",
+  "scripts": {
+    "start": "npx tsx src/index.ts",
+    "backend": "npx tsx backend/server.ts",
+    "dev": "concurrently \"npm run start\" \"npm run backend\""
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.7.13",
+    "ws": "^8.18.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "concurrently": "^9.0.0"
+  }
+}

@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package gateway;
+
+option go_package = "./gateway";
+
+service UserService {
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+  rpc CreateUser(CreateUserRequest) returns (GetUserResponse);
+  rpc ListUsers(ListUsersRequest) returns (stream GetUserResponse);
+  rpc StreamEvents(StreamEventsRequest) returns (stream Event);
+}
+
+message GetUserRequest {
+  string id = 1;
+}
+
+message CreateUserRequest {
+  string name = 1;
+  string email = 2;
+}
+
+message GetUserResponse {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+message ListUsersRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message StreamEventsRequest {
+  string topic = 1;
+}
+
+message Event {
+  string type = 1;
+  string data = 2;
+  int64 timestamp = 3;
+}
